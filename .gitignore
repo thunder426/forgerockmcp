@@ -1,0 +1,24 @@
+# Per-folder env files contain generated passwords + the shared MCP secret.
+# .env.example files are committed; .env files never are.
+ops/env/.env
+mcp-server/env/.env
+agent/env/.env
+
+# Local test-user reference with plaintext dev passwords. Keep local-only.
+testusers.csv
+
+# cached forgeops checkout (lives under ops/ now)
+ops/.cache/
+
+# build output
+mcp-server/dist/
+mcp-server/node_modules/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# scratch
+/tmp/

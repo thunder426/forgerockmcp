@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "forgerock": {
+      "command": "node",
+      "args": ["${CLAUDE_PROJECT_DIR}/mcp-server/dist/index.js"],
+      "env": {
+        "AM_BASE_URL": "https://forgeops.example.com/am",
+        "AM_REALM": "root",
+        "AM_ADMIN_USER": "amadmin",
+        "AM_ADMIN_PASSWORD": "${AM_ADMIN_PASSWORD}",
+        "AM_INSECURE_TLS": "true"
+      }
+    }
+  }
+}
