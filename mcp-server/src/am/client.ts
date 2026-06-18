@@ -50,9 +50,14 @@ export class AmClient {
     const info = await this.rawJson("GET", "/json/serverinfo/*");
     this.cookieName = info.cookieName;
 
+    // Force the ldapService chain rather than whatever the /root org default
+    // is — the default is configurable per-realm and operators sometimes point
+    // it at an MFA-enabled tree (e.g. UP-MFA-Demo in this stack), which would
+    // break header-based amadmin login. ldapService is the historical default
+    // and stays plain username/password.
     const auth = await this.rawJson(
       "POST",
-      "/json/realms/root/authenticate",
+      "/json/realms/root/authenticate?authIndexType=service&authIndexValue=ldapService",
       {},
       {
         "X-OpenAM-Username": this.cfg.adminUser,
