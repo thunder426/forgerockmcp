@@ -4,8 +4,14 @@ ops/env/.env
 mcp-server/env/.env
 agent/env/.env
 
+# Scoped MCP tokens (plaintext secrets). Only the .example is committed.
+mcp-server/env/tokens.json
+
 # Local test-user reference with plaintext dev passwords. Keep local-only.
 testusers.csv
+
+# Local access/credentials cheat-sheet (plaintext dev passwords). Never commit.
+LOCAL-ACCESS.md
 
 # cached forgeops checkout (lives under ops/ now)
 ops/.cache/

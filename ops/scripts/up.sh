@@ -116,9 +116,20 @@ fi
 
 # --- 7. Wait for readiness --------------------------------------------------
 log "Waiting for AM, IDM, DS pods to be Ready"
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=am --timeout=15m
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=idm --timeout=10m
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=ds-idrepo --timeout=10m
+# ForgeOps 2025.2.1 labels component pods app=<component> (app.kubernetes.io/name is
+# 'identity-platform' for all of them). Wait on app=<component>, and tolerate the pod
+# not existing yet (kubectl wait errors immediately on a zero-match selector).
+wait_ready() {
+  local sel="$1" timeout="$2"
+  for _ in $(seq 1 30); do
+    kubectl get pod -l "$sel" -n "$NAMESPACE" 2>/dev/null | grep -q . && break
+    sleep 5
+  done
+  kubectl wait --for=condition=ready pod -l "$sel" -n "$NAMESPACE" --timeout="$timeout"
+}
+wait_ready app=am 15m
+wait_ready app=idm 10m
+wait_ready app=ds-idrepo 10m
 
 ok "Stack is up. Next steps:"
 cat <<EOF

@@ -22,7 +22,7 @@ never writes. Hand off to `create-tree` / `update-tree` (TBD) after explaining.
 
 ## Required references
 
-Both files live at `agent/skills/_references/`:
+Both files live at `forgerockmcp/agent/skills/_references/`:
 
 - **`am-node-outcomes.md`** — hand-curated outcome names per node type, plus
   the common multi-node idioms and the red flags to look for. Small (~14 KB);
@@ -31,7 +31,7 @@ Both files live at `agent/skills/_references/`:
 - **`am-node-catalog.json`** — generated catalog of all ~140 AM node types
   with their `name`, `tags`, `help`, and config-field schema. **Don't load
   whole** (~400 KB / ~115K tokens). Query with `jq` per the recipes in
-  outcomes.md. Regenerate via `cd ops && make node-catalog` if it looks stale.
+  outcomes.md. Regenerate via `cd forgerockmcp/ops && make node-catalog` if it looks stale.
 
 ## Process
 
@@ -81,7 +81,7 @@ fetch the instance:
 For any other node type whose name doesn't tell you what it does, query the
 catalog for just that type — don't load the whole file:
 ```bash
-jq '.types.<TypeId> | {name, help, tags}' agent/skills/_references/am-node-catalog.json
+jq '.types.<TypeId> | {name, help, tags}' forgerockmcp/agent/skills/_references/am-node-catalog.json
 ```
 The `help` field is usually one sentence and is enough.
 
@@ -120,6 +120,11 @@ important:
 - `entryNodeId` not in `nodes` (tree is broken).
 - Decision node with both outcomes pointing to the same target (probable bug).
 - `IdentifyExistingUserNode` `false` branch leaking enumeration info.
+- A node pinned to an older `version` than AM currently registers for its type
+  (compare the tree's `nodes[<uuid>].version` against `get_node`'s
+  `_type.version` for that type). Often harmless, but flag it — a node left at
+  `"1.0"` while AM ships a newer version can run an older config schema than
+  intended. Note it; fixing is `update-tree`'s job, not this skill's.
 
 ## Output template
 

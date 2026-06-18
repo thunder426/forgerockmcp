@@ -1,0 +1,14 @@
+| Username | Password | Name | Email |
+|---|---|---|---|
+| `alice` | `Hq7$Wpz9Kxv` | Alice Anderson | alice@example.com |
+| `bob` | `Mb4$Tzr8Qnp` | Bob Brown | bob@example.com |
+
+MFA Tree Prompt:
+
+create a new tree in root realm with name "TestMFA", do username and password auth first, then add a select MFA page, user can select between Email OTP, SMS OTP and TOTP, if user selects TOTP and user doesn't have one registered, need to prompt user with registration, after registration the tree should verify the TOTP again then allow user to login, Email and SMS you don't need to actually configure SMTP or SMS server, you can hardcode the OTP to 000000 and let user input and verify.
+
+MFA Tree update:
+add another custom page after verifying the password, check if username is alice, if yes, prompt with a question "Hi Alice, What is your email?", user need to input the email correctly(retrieve from the user's profile) to proceed with MFA selection.
+
+Progressive profile:
+next I want you to hide SMS option if user doesn't have a telephone number and if uses other MFA and logged in, prompt user to enter the telephone number and verify SMS(hard code 000000) after it, if successful save that into user's profile, if not retry 3 times, then prompt with failure message, but still allow user to login, just without adding the phone

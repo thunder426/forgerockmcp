@@ -25,7 +25,7 @@ skill anyway — see step 2).
 
 ## Required references
 
-All under `agent/skills/_references/`:
+All under `forgerockmcp/agent/skills/_references/`:
 
 - **`am-node-outcomes.md`** — outcome names per node type, multi-node idioms,
   red flags. Critical for getting `connections` right when rewiring. Small
@@ -35,7 +35,7 @@ All under `agent/skills/_references/`:
   a well-known idiom (e.g. "add brute-force protection" ≈ Recipe 1b),
   borrow the recipe's shape rather than inventing one. Index it first:
   ```bash
-  grep -n -i -B 1 "user intent" agent/skills/_references/am-tree-recipes.md
+  grep -n -i -B 1 "user intent" forgerockmcp/agent/skills/_references/am-tree-recipes.md
   ```
 - **`am-node-catalog.json`** — generated, ~115K tokens. **Don't load whole.**
   Query with `jq` (recipes in outcomes.md) when you need a schema for a node
@@ -158,7 +158,7 @@ For any node type the edit introduces, fetch its config schema. Prefer the
 local catalog:
 
 ```bash
-jq '.types.<TypeId>' agent/skills/_references/am-node-catalog.json
+jq '.types.<TypeId>' forgerockmcp/agent/skills/_references/am-node-catalog.json
 ```
 
 …or `mcp__forgerock__get_node_type_schema` if you suspect the catalog is
@@ -203,6 +203,28 @@ emits `PATCHED`/`FAILURE`, for example), regenerate the diff and re-confirm
 with the user. A single wrong outcome key is enough to take a path dead at
 runtime; the write itself will succeed and look fine.
 
+### 4c. Use the latest node version (for any node you add)
+
+Each entry in a tree's `nodes` map carries a `version` (the node-type version
+AM uses to interpret it) — separate from the node record; `upsert_node` has no
+version arg. ⚠ **`edit_journey_edges` `addNodes` defaults a node's `version` to
+`"1.0"` when you omit it** (same default `create_journey` uses). For any node
+this edit *introduces*, prefer the latest version AM actually supports and set
+it explicitly in the `addNodes` entry, rather than shipping the 1.0 default.
+
+Discover the current version with the tools you have (prefer the first):
+
+1. **Live instance** — `get_node {type, id}`; the response's `_type.version` is
+   the version AM currently registers for that type.
+2. **Seed tree** — `get_journey` on an AM-created seed tree, then read
+   `nodes[<uuid>].version` of an entry with the same `nodeType`.
+3. **Can't determine it** — `"1.0"` is correct for most AM 8.1 nodes; override
+   only when discovery shows higher, and note the assumption in the diff.
+
+For nodes you're **only rewiring** (not adding), leave their existing `version`
+alone — `edit_journey_edges` preserves it; don't gratuitously bump versions as
+part of an unrelated edit.
+
 ### 5. Apply
 
 Order matters. Do it bottom-up so a partial failure leaves a clean tail:
@@ -216,6 +238,8 @@ Order matters. Do it bottom-up so a partial failure leaves a clean tail:
    changed source node, `addNodes` for any new node to insert into the tree's
    map, `removeNodeIds` for any node to drop from the tree's map. Doing it
    in one call keeps the tree consistent (no half-applied state mid-edit).
+   Set `version` explicitly on each `addNodes` entry (step 4c) — omitting it
+   stamps `"1.0"`.
 4. **Tree-level changes**, if any — one `update_journey` call.
 5. **Delete orphaned node records**, if any. `edit_journey_edges` with
    `removeNodeIds` only removes them from the *tree's* map; the underlying
@@ -297,7 +321,16 @@ This is Recipe 1 → Recipe 1b. The diff is one new node + one rewired edge.
 User: *"Replace the DataStoreDecision in MyLogin with a ScriptedDecision that
 also checks the user's department."*
 
-1. `upsert_script` for the SDN source (sets `outcome`).
+1. `upsert_script` for the SDN source. ⚠ On this stack (ForgeOps 2025.2 /
+   AM 8.1) `upsert_script` creates **next-gen `evaluatorVersion "2.0"`**
+   scripts: select the outcome with `action.goTo("<name>")` (NOT the legacy
+   `outcome = "..."`), use `nodeState` (NOT `sharedState`/`transientState`),
+   `callbacksBuilder.*` to prompt, `callbacks.getNameCallbacks().get(0)` to read
+   input. `idRepository.getIdentity()` needs the **uuid** (resolve via an
+   `IdentifyExistingUserNode` → `_id`), and **never `.iterator()` a returned
+   `List`** (sandbox-blocked — use `.get(0)`). Legacy-API or `.iterator()`
+   scripts save, wire, and pass explain-tree but throw at runtime (HTTP 401) —
+   see Recipe 7 for the 2.0 API table.
 2. `upsert_node` ScriptedDecisionNode `<U_sdn>` with `config.outcomes`
    declared (e.g. `[{id:"allow",displayName:"allow"},{id:"deny",displayName:"deny"}]`)
    and `config.script` = the script id.
@@ -372,6 +405,10 @@ or wire it in.
   one edge. explain-tree is cheap and catches the wiring mistakes.
 - **Never edit a tree's `nodes` map via `update_journey`** — it doesn't take
   one. Use `edit_journey_edges`'s `addNodes` / `removeNodeIds`.
+- **Never let an added node's `version` silently default.** `addNodes` stamps
+  `"1.0"` for any node without an explicit `version`. When AM registers a newer
+  version for the type, set it (step 4c) so the graph matches the upserted
+  config. (Rewiring an existing node doesn't touch its version — that's fine.)
 
 ## Example walkthrough: "Add a retry limit to MyLogin (3 attempts)"
 

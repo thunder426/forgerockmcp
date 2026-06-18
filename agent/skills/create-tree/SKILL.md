@@ -21,7 +21,7 @@ instead. If they want to *understand* a tree, use `explain-tree`.
 
 ## Required references
 
-All under `agent/skills/_references/`:
+All under `forgerockmcp/agent/skills/_references/`:
 
 - **`am-node-outcomes.md`** — outcome names per node type, multi-node idioms,
   and the red flags. Critical for getting `connections` right. Small (~14 KB);
@@ -31,7 +31,7 @@ All under `agent/skills/_references/`:
   (each is a complete `upsert_node` + `create_journey` build). Don't load the
   whole file (~17 KB but growing) — index it first:
   ```bash
-  grep -n -i -B 1 "user intent" agent/skills/_references/am-tree-recipes.md
+  grep -n -i -B 1 "user intent" forgerockmcp/agent/skills/_references/am-tree-recipes.md
   ```
   Then read just the matching recipe section. Match the user's intent to one
   of these *first*; only build from scratch if nothing matches.
@@ -113,6 +113,7 @@ Produce a Markdown build plan and stop. The plan has four parts:
 
 **Entry**: #3
 **Sub-trees referenced**: none
+**Node versions**: latest per type (e.g. all 1.0 on this stack — confirmed via get_node `_type.version` / seed tree)
 **Schema lookups still needed**: get_node_type_schema for RetryLimitDecisionNode (config field name)
 
 Reply "go" to build, or correct anything above.
@@ -128,7 +129,7 @@ options, prefer the first:
 
 - **Local catalog query** (free, instant, offline-OK):
   ```bash
-  jq '.types.<TypeId>' agent/skills/_references/am-node-catalog.json
+  jq '.types.<TypeId>' forgerockmcp/agent/skills/_references/am-node-catalog.json
   ```
 - **Live AM lookup** (`mcp__forgerock__get_node_type_schema`) — use when you
   need to verify against the running AM (e.g. a recent forgeops upgrade may
@@ -141,6 +142,32 @@ For dynamic-outcome node types (ChoiceCollectorNode, ScriptedDecisionNode,
 ConfigProviderNode, ConsentNode — see `am-node-outcomes.md`), be honest: the
 outcome names depend on the config you're about to write. Plan the outcome
 names explicitly and confirm with the user before wiring.
+
+### 4b. Use the latest node version
+
+Each entry in a tree's `nodes` map carries a `version` (the node-type version
+AM uses to interpret that node). It is **separate** from the node record:
+`upsert_node` has no version arg — version is a tree-graph attribute, set in
+the `create_journey` `nodes` map (and in `edit_journey_edges` `addNodes`).
+
+⚠ **`create_journey` defaults every node's `version` to `"1.0"` when you omit
+it.** Most AM 8.1 node types are still at 1.0, but some ship higher. Pinning a
+node at 1.0 when AM registers a newer version can load an older config schema
+or behavior than the config you wrote with `upsert_node` expects. **Prefer the
+latest version AM actually supports for each type, and set it explicitly** —
+don't rely on the default.
+
+Discover the current version with the tools you already have (prefer the
+first):
+
+1. **Live instance** — `get_node {type, id}` on any existing node of that type;
+   the response's `_type.version` is the version AM currently registers.
+2. **Seed tree** — `get_journey` on an AM-created seed tree, then read
+   `nodes[<uuid>].version` for an entry of the same `nodeType`; that's what
+   AM's own bootstrap stamped (i.e. current).
+3. **Can't determine it** — `"1.0"` is correct for the large majority of AM 8.1
+   nodes; only override when discovery shows higher. Note the assumption in the
+   plan.
 
 ### 5. Build bottom-up
 
@@ -183,7 +210,7 @@ When intent doesn't fit any recipe:
 2. **Pick a node type per step** by querying the catalog. Common tags:
    `basic authn`, `risk`, `mfa`, `utilities`, `behavioral`, `federation`,
    `social`, `iot`, `otp`, `idm`. List live tags with
-   `jq -r '[.types[].tags[]]|unique|.[]' agent/skills/_references/am-node-catalog.json`.
+   `jq -r '[.types[].tags[]]|unique|.[]' forgerockmcp/agent/skills/_references/am-node-catalog.json`.
    Or do a keyword search across name/help/tags — see "Querying the references"
    in `am-node-outcomes.md`.
 3. **Fetch each picked type's config schema** with `get_node_type_schema`.
@@ -211,12 +238,26 @@ When intent doesn't fit any recipe:
   against the node types, so a typo can make it through and break at runtime.
 - **Never skip the verify step.** Even simple-looking trees can be wrong in
   ways that look right to a human glance but explain-tree will catch.
+- **Never let node `version` silently default.** `create_journey` stamps any
+  node you don't give a `version` as `"1.0"`. When AM registers a newer version
+  for that type, set it explicitly (step 4b) so the graph matches the config
+  you upserted — don't ship the silent default unchecked.
 - **Scripts are separate from nodes — call them in the right order.** When
   building with `ScriptedDecisionNode`, the order is `upsert_script` →
   `upsert_node ScriptedDecisionNode (referencing the script id)` →
   `create_journey`. Outcomes are declared on the SDN's `config.outcomes`,
-  NOT on the script. The script's job is to set `outcome = "<one of those names>"`.
-  See Recipe 7 for a worked example.
+  NOT on the script. The script's job is to select one of those names.
+  **⚠ On this stack (ForgeOps 2025.2 / AM 8.1) `upsert_script` creates
+  next-gen `evaluatorVersion "2.0"` scripts — the legacy 1.0 API does NOT
+  exist there.** Use `action.goTo("<name>")` (NOT `outcome = "..."`),
+  `nodeState.get/putShared/putTransient` (NOT `sharedState`/`transientState`),
+  `callbacksBuilder.*` to prompt, and `callbacks.getNameCallbacks().get(0)` to
+  read input. Legacy-API scripts save, wire, and pass explain-tree but throw at
+  runtime (HTTP 401). Two sandbox traps that also only fail at runtime:
+  `idRepository.getIdentity()` needs the user's **uuid** not uid (resolve it
+  with an `IdentifyExistingUserNode` → `_id`), and **never `.iterator()` a
+  returned `List`** — it's blocked; use `.get(0)`. See Recipe 7 for the full
+  2.0 API table and a worked prompt-and-verify example.
 
 ## Example walkthroughs
 

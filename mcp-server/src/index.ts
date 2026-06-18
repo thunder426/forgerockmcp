@@ -8,8 +8,15 @@ import {
 import { zodToJsonSchema } from "./jsonSchema.js";
 import { loadConfig, loadEnv } from "./config.js";
 import { AmClient, AmError } from "./am/client.js";
+import { IdmError } from "./idm/client.js";
 import { IdmClient } from "./idm/client.js";
-import { AuthError, loadAuthenticator, type Permission } from "./auth.js";
+import {
+  AuthError,
+  loadAuthenticator,
+  type AuthIdentity,
+  type Permission,
+} from "./auth.js";
+import { createToolLogger, redactArgs } from "./logger.js";
 import {
   createJourney,
   createJourneyInput,
@@ -92,6 +99,8 @@ const cfg = loadConfig(env);
 // server reads it. The agent's dotenv (agent/env/.env) is in a different folder
 // and never loaded. Cross-folder isolation is enforced in config.ts's loadDotenv.
 const authenticator = loadAuthenticator(env);
+// Audit log of every tool call the agent makes (JSONL file + stderr mirror).
+const toolLogger = createToolLogger(env);
 const am = new AmClient({
   baseUrl: cfg.amBaseUrl,
   realm: cfg.amRealm,
@@ -152,7 +161,7 @@ const tools = [
   },
   {
     name: "delete_journey",
-    permission: "write",
+    permission: "delete",
     description:
       "Delete a journey. Cascades to its referenced nodes (AM 8 behavior — observed: nodes referenced only by the deleted tree go away too). To preserve a node, remove its tree reference via edit_journey_edges first.",
     inputSchema: zodToJsonSchema(deleteJourneyInput),
@@ -215,7 +224,7 @@ const tools = [
   },
   {
     name: "delete_node",
-    permission: "write",
+    permission: "delete",
     description: "Delete a node by type + UUID. Doesn't touch any tree that references it; remove edges first via edit_journey_edges.",
     inputSchema: zodToJsonSchema(deleteNodeInput),
     handler: (args: unknown) => deleteNode(am, deleteNodeInput.parse(args)),
@@ -238,7 +247,7 @@ const tools = [
   },
   {
     name: "delete_realm",
-    permission: "write",
+    permission: "delete",
     description:
       "Delete a realm by name (preferred) or by id. Resolves name → id via list_realms when needed; fails if the name is ambiguous.",
     inputSchema: zodToJsonSchema(deleteRealmInput),
@@ -273,7 +282,7 @@ const tools = [
   },
   {
     name: "delete_identity_store",
-    permission: "write",
+    permission: "delete",
     description: "Delete an identity store from a realm.",
     inputSchema: zodToJsonSchema(deleteIdentityStoreInput),
     handler: (args: unknown) =>
@@ -313,7 +322,7 @@ const tools = [
   },
   {
     name: "delete_user",
-    permission: "write",
+    permission: "delete",
     description:
       "Delete an IDM-managed user by uid (userName). Only manages users visible to IDM managed/user.",
     inputSchema: zodToJsonSchema(deleteUserInput),
@@ -345,7 +354,7 @@ const tools = [
   },
   {
     name: "delete_script",
-    permission: "write",
+    permission: "delete",
     description:
       "Delete a script by id. Doesn't check whether any node still references it; check first with list_nodes type=ScriptedDecisionNode and inspect each one's config.script.",
     inputSchema: zodToJsonSchema(deleteScriptInput),
@@ -372,8 +381,13 @@ const tools = [
  * connects its own Server instance — for stdio that's one for the process; for
  * HTTP we create one per incoming request (stateless mode), so handlers can't
  * accidentally share per-request state.
+ *
+ * `headerToken` is the token lifted from the request's `Authorization: Bearer`
+ * header (HTTP transport only). It serves as a fallback for callers that can't
+ * inject a per-call `_authToken` argument but can set a static connection
+ * header — e.g. an MCP host configured with `headers` in its server entry.
  */
-function buildServer(): Server {
+function buildServer(transport: "stdio" | "http", headerToken?: string): Server {
   const server = new Server(
     { name: "forgerock-mcp", version: "0.1.0" },
     { capabilities: { tools: {} } }
@@ -388,22 +402,50 @@ function buildServer(): Server {
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const startedAt = Date.now();
     const tool = tools.find((t) => t.name === req.params.name);
+    // Peel off _authToken so the per-tool zod schemas don't have to know about it.
+    // The agent presents the token either as this call arg or, on HTTP, via the
+    // Authorization header (captured into headerToken). The call arg wins when
+    // both are present.
+    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+    const { _authToken, ...handlerArgs } = args;
+    const argKeys = Object.keys(handlerArgs);
+
     if (!tool) {
+      toolLogger.record({
+        ts: new Date().toISOString(),
+        transport,
+        tool: req.params.name,
+        permission: "unknown",
+        status: "unknown_tool",
+        durationMs: Date.now() - startedAt,
+        argKeys,
+      });
       return {
         isError: true,
         content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }],
       };
     }
-    // Peel off _authToken so the per-tool zod schemas don't have to know about it.
-    // The agent must pass it on every tool call regardless of transport.
-    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
-    const { _authToken, ...handlerArgs } = args;
+    let identity: AuthIdentity | undefined;
     try {
-      await authenticator.authorize(tool.permission, {
-        token: typeof _authToken === "string" ? _authToken : undefined,
+      const callToken =
+        (typeof _authToken === "string" ? _authToken : undefined) ?? headerToken;
+      identity = await authenticator.authorize(tool.permission, {
+        token: callToken,
       });
       const result = await tool.handler(handlerArgs);
+      toolLogger.record({
+        ts: new Date().toISOString(),
+        transport,
+        tool: tool.name,
+        permission: tool.permission,
+        tokenName: identity.name,
+        status: "ok",
+        durationMs: Date.now() - startedAt,
+        argKeys,
+        args: redactArgs(handlerArgs),
+      });
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
@@ -413,9 +455,26 @@ function buildServer(): Server {
           ? `Auth error: ${err.message}`
           : err instanceof AmError
             ? `AM error ${err.status}: ${JSON.stringify(err.body)}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
+            : err instanceof IdmError
+              ? `IDM error ${err.status}: ${JSON.stringify(err.body)}`
+              : err instanceof Error
+                ? err.message
+                : String(err);
+      // On a privilege-denied error the token was recognized — log which one.
+      const tokenName =
+        identity?.name ?? (err instanceof AuthError ? err.identity?.name : undefined);
+      toolLogger.record({
+        ts: new Date().toISOString(),
+        transport,
+        tool: tool.name,
+        permission: tool.permission,
+        tokenName,
+        status: err instanceof AuthError ? "auth_error" : "error",
+        durationMs: Date.now() - startedAt,
+        argKeys,
+        args: redactArgs(handlerArgs),
+        error: msg,
+      });
       return {
         isError: true,
         content: [{ type: "text", text: msg }],
@@ -457,11 +516,11 @@ function parseArgs(argv: string[]): CliOptions {
 }
 
 async function runStdio(): Promise<void> {
-  const server = buildServer();
+  const server = buildServer("stdio");
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `forgerock-mcp v0.1.0 ready (stdio); AM=${cfg.amBaseUrl} realm=${cfg.amRealm} user=${cfg.amAdminUser} auth=${authenticator.modeName()}`
+    `forgerock-mcp v0.1.0 ready (stdio); AM=${cfg.amBaseUrl} realm=${cfg.amRealm} user=${cfg.amAdminUser} auth=${authenticator.modeName()} log=${toolLogger.filePath ?? "stderr-only"}`
   );
 }
 
@@ -481,7 +540,15 @@ async function runHttp(opts: CliOptions): Promise<void> {
   // sticky-session story. Easier to reason about; trivially horizontally
   // scalable later.
   app.post("/mcp", async (req, res) => {
-    const server = buildServer();
+    // Lift a bearer token off the connection header so an MCP host can supply
+    // the secret via static `headers` config instead of a per-call argument.
+    // Falls through to the call-arg `_authToken` path when absent.
+    const authHeader = req.headers.authorization;
+    const headerToken =
+      typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+        ? authHeader.slice("Bearer ".length).trim()
+        : undefined;
+    const server = buildServer("http", headerToken);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless mode
     });
@@ -516,7 +583,7 @@ async function runHttp(opts: CliOptions): Promise<void> {
 
   app.listen(opts.port, opts.host, () => {
     console.error(
-      `forgerock-mcp v0.1.0 ready (http://${opts.host}:${opts.port}/mcp); AM=${cfg.amBaseUrl} realm=${cfg.amRealm} user=${cfg.amAdminUser} auth=${authenticator.modeName()}`
+      `forgerock-mcp v0.1.0 ready (http://${opts.host}:${opts.port}/mcp); AM=${cfg.amBaseUrl} realm=${cfg.amRealm} user=${cfg.amAdminUser} auth=${authenticator.modeName()} log=${toolLogger.filePath ?? "stderr-only"}`
     );
   });
 }

@@ -24,7 +24,7 @@ The authoritative setup walkthrough (every gotcha + fix) is [docs/local-stack-se
 | `make preflight` | verify CLIs and `/etc/hosts` (needs `127.0.0.1 forgeops.example.com`) |
 | `make up` | start Minikube + run `forgeops install` (~5–10 min first run, idempotent — safe to re-run) |
 | `make bootstrap` | create the `mcp-admin` user; **also writes AM_ADMIN_PASSWORD into mcp-server/env/.env** |
-| `make token` | generate the shared MCP secret; writes both halves (mcp-server + agent) |
+| `make token` | rotate the agent's token: upserts the `interactive-agent` entry in mcp-server/env/tokens.json and writes the same value to FORGEROCK_AGENT_TOKEN in agent/env/.env |
 | `make smoke` | AM login + journey list + IDM ping |
 | `make passwords` | print generated `amadmin` / `openidm-admin` passwords from the k8s secrets |
 | `make ps` / `make logs` | `kubectl get pods` / tail AM pod logs in the `identity` namespace |
@@ -63,7 +63,9 @@ Cross-folder reads at runtime would be a security regression — we want to be a
 
 ### MCP server design
 
-[mcp-server/src/index.ts](mcp-server/src/index.ts) is a small registry: each tool is `{ name, permission, description, inputSchema, handler }`. `permission` is `"read"` or `"write"`. `ListTools` and `CallTool` handlers iterate the array. Adding a new tool = add a file under `src/tools/`, export `<name>Input` (Zod) + handler, register in `index.ts` with a permission tag.
+[mcp-server/src/index.ts](mcp-server/src/index.ts) is a small registry: each tool is `{ name, permission, description, inputSchema, handler }`. `permission` is `"read"`, `"write"`, or `"delete"` (the six `delete_*` tools are tagged `delete`; create/update/upsert are `write`; list/get are `read`). `ListTools` and `CallTool` handlers iterate the array. Adding a new tool = add a file under `src/tools/`, export `<name>Input` (Zod) + handler, register in `index.ts` with a permission tag.
+
+Every tool call is also written to an audit log (one JSONL line: ts, transport, tool, permission, tokenName, status, durationMs, argKeys, redacted args, error) by [mcp-server/src/logger.ts](mcp-server/src/logger.ts). Default file `mcp-server/logs/tool-usage.log` + a concise stderr mirror; never stdout. Knobs: `MCP_LOG_TOOL_USAGE`, `MCP_LOG_FILE`, `MCP_LOG_ARGS`, `MCP_LOG_STDERR`.
 
 The Server is built by a `buildServer()` factory so each transport gets its own instance. **Stdio is the default** (matches how MCP hosts spawn the binary as a child process). **`--http` runs the same code over HTTP** on `127.0.0.1:8765/mcp` (override with `--port`/`--host` or `MCP_HTTP_PORT`/`MCP_HTTP_HOST`). HTTP mode is *stateless*: a fresh `Server` + `StreamableHTTPServerTransport` per request, which matches our per-call-token auth model and trivially scales horizontally if we ever need that. The SDK's `createMcpExpressApp` is used so DNS-rebinding protection is on automatically when bound to a localhost address.
 
@@ -79,13 +81,13 @@ The Server is built by a `buildServer()` factory so each transport gets its own 
 
 ### Auth gate
 
-[mcp-server/src/auth.ts](mcp-server/src/auth.ts) wraps every tool call. Two modes selected by `MCP_AUTH_MODE`:
+[mcp-server/src/auth.ts](mcp-server/src/auth.ts) wraps every tool call. Privileges are **hierarchical: read < write < delete** — a `write` token can read, a `delete` token can do everything. `authorize()` returns the matched token's identity (`{name, privileges}`), which flows into the audit log. Three modes selected by `MCP_AUTH_MODE`:
 
-- **`static` (default)**: server validates each call's `_authToken` against `MCP_SERVER_TOKEN` with a constant-time compare. The agent must independently know the same value (stored on its side as `FORGEROCK_AGENT_TOKEN` in agent/env/.env) and pass it as `_authToken` on every call.
+- **`static` (default)**: each call's token is matched (constant-time) against a set of **issued tokens**. Tokens come solely from a JSON tokens file — `MCP_TOKENS_FILE`, default [mcp-server/env/tokens.json](mcp-server/env/tokens.json) (gitignored; see `tokens.json.example`) — of `[{name, token, privileges:[read|write|delete]}]`. There is no legacy single-`MCP_SERVER_TOKEN` fallback; boot fails fast if the tokens file is absent or empty. The token is presented either as the `_authToken` call argument or an `Authorization: Bearer <token>` header (HTTP transport); the call arg wins when both are present.
 - **`oauth-am` (NOT IMPLEMENTED)**: stubbed; will introspect each call's bearer against AM and check `forgerock.read` / `forgerock.write` scope.
 - **`disabled`**: bypass for tests; requires `MCP_AUTH_DISABLED_ACK=true` to confirm.
 
-Server boot fails fast with a clear error if `MCP_SERVER_TOKEN` is missing in static mode. Per-tool tagging (read vs write) is in `index.ts`.
+Per-tool privilege tagging is in `index.ts`. A token presented for a tool above its level is rejected with `Token '<name>' lacks the '<priv>' privilege`, logged as `auth_error` with the token name.
 
 ### Config loading
 
@@ -93,7 +95,7 @@ Server boot fails fast with a clear error if `MCP_SERVER_TOKEN` is missing in st
 
 ### MCP host wiring
 
-Per repo memory: the MCP server is registered in `~/.claude.json` directly, not via this repo's `.mcp.json`. The `.mcp.json` here is a reference. The server reads `mcp-server/env/.env` itself, so secrets don't need to be in the host config — but the agent must still pass `_authToken` on every tool call.
+Per repo memory: the MCP server is registered in `~/.claude.json` directly, not via this repo's `.mcp.json`. The `.mcp.json` here is a reference. The active registration is the HTTP transport (`forgerock-http` → `http://127.0.0.1:8765/mcp`), which carries the agent's token in an `Authorization: Bearer <token>` header in the server entry — so the host injects auth on every call and no per-call `_authToken` argument is needed. (The `_authToken` argument still works as a fallback for callers that can't set headers.) The token value must be one of the secrets in `mcp-server/env/tokens.json`.
 
 ## Gotchas
 
@@ -104,4 +106,4 @@ Per repo memory: the MCP server is registered in `~/.claude.json` directly, not 
 - **`ForgeOps 2025.2` default overlay only configures the `root` realm.** Use `mcp__forgerock__create_realm` to make `alpha`; the realm's `OpenDJ` identity store (`LDAPv3ForForgeRockIAM`) is auto-provisioned at realm-create time.
 - **AM admin console "create user" form is broken** in this overlay (sends username as fr-idm-uuid → DS LDAP error 21). Use `mcp__forgerock__create_user` or the IDM admin UI at `/admin` instead.
 - **AM /users PUT requires `userPassword` on every update** — `update_user` always rotates the password as a result. For non-rotating updates, use IDM (`/openidm/managed/user`); IDM tools TBD.
-- **Token must match between sides.** If you change `MCP_SERVER_TOKEN` in mcp-server/env/.env you must also update `FORGEROCK_AGENT_TOKEN` in agent/env/.env. Use `make token` (from ops/) to rotate both atomically in dev.
+- **Token must match between sides.** The agent's token must be one of the entries in mcp-server/env/tokens.json *and* match what the host presents (the `Authorization: Bearer` value in `~/.claude.json`, and/or `FORGEROCK_AGENT_TOKEN` in agent/env/.env). `make token` (from ops/) rotates the `interactive-agent` entry in tokens.json and writes the same value to agent/env/.env — but it does **not** edit `~/.claude.json`, so if the host pins the token in a Bearer header, update that by hand and restart the host. After any rotation, restart the server so it reloads tokens.json.

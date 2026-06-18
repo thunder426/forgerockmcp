@@ -394,22 +394,26 @@ create_journey({
 
 - **The script source must NOT be base64-encoded by the caller.**
   `upsert_script` accepts plain text and encodes for you.
-- **Script `context` value depends on AM version.** Use
-  `AUTHENTICATION_TREE_DECISION_NODE` for AM 8.x (live-verified on ForgeOps
-  2025.2 / AM 8.1). Older docs and AM 7.x use `SCRIPTED_DECISION_NODE`. If
-  `upsert_script` returns a "context not found / invalid" error, switch
-  values. List valid contexts on the live AM with
+- **Script `context` value**: use `SCRIPTED_DECISION_NODE` (canonical on
+  ForgeOps 2025.2 / AM 8.1, live-verified). `AUTHENTICATION_TREE_DECISION_NODE`
+  is an older alias that still resolves, but `list_script_contexts` explicitly
+  says "prefer SCRIPTED_DECISION_NODE". If `upsert_script` returns "context not
+  found / invalid", list valid contexts with
   `mcp__forgerock__list_script_contexts`.
 - **`config.outcomes` is the source of truth for outcome names.** If the
   script sets `outcome = "premium"` but the SDN's outcomes are `["gold","silver"]`,
   AM raises a runtime error when that branch is taken.
 - **`inputs`/`outputs`** are sharedState key names the script reads/writes.
   `["*"]` = any. Be specific in production for performance + safety.
-- **Available variables in the script** (depends on the SDN evaluator version):
-  `sharedState`, `transientState`, `requestHeaders`, `requestParameters`,
-  `existingSession`, `idRepository`, `secrets`, `httpClient`, `logger`,
-  `nodeState`, `outcome`. Ref AM 8.1 docs for full list — they vary by
-  context.
+- **Available variables in the script depend on the evaluator version.**
+  ⚠ ForgeOps 2025.2 / AM 8.1 scripts created via `upsert_script` default to
+  the **next-gen evaluator (`evaluatorVersion: "2.0"`)**, whose API is NOT the
+  legacy one most docs/examples show. See the next subsection — getting this
+  wrong is the #1 way these scripts fail at runtime (and `explain-tree` can't
+  catch it; it only checks wiring). Confirm a script's version with
+  `mcp__forgerock__get_script` (`evaluatorVersion` field); the global default
+  script "Next Generation Scripted Decision Node Script" is 2.0 and a good
+  reference (`action.goTo("true")`).
 - **AM 8 script sandbox blocks `java.lang.*` direct access.** Calling
   `java.lang.System.currentTimeMillis()` throws `TypeError: Cannot call
   property currentTimeMillis in object [JavaPackage java.lang.System]`. For
@@ -419,6 +423,118 @@ create_journey({
   access. Live-burned during MyLogin sanity-walk.
 - **Cleanup ordering**: delete the SDN before the script, or AM will refuse
   to delete a script that's still referenced.
+
+### ⚠ Next-gen evaluator (2.0) script API — read before writing any SDN script
+
+On this stack (ForgeOps 2025.2 / AM 8.1) `upsert_script` creates scripts at
+`evaluatorVersion "2.0"` (next-gen). **The legacy 1.0 bindings do not exist in
+2.0** — `outcome = "x"`, `sharedState`, and `transientState` throw
+`ReferenceError` / silently no-op. A script written the legacy way *saves
+fine, wires fine, and explain-tree shows no red flag* — it only blows up when
+AM executes the node (HTTP 401 "Login failure"). All of the below was
+live-burned building the `MfaLogin` tree on 2026-06-10.
+
+| Need | Legacy 1.0 (DON'T use here) | Next-gen 2.0 (correct) |
+|------|----------------------------|------------------------|
+| Set the outcome | `outcome = "set"` | `action.goTo("set")` |
+| Read shared state | `sharedState.get("k")` | `nodeState.get("k")` |
+| Write shared state | `sharedState.put("k",v)` | `nodeState.putShared("k",v)` |
+| Write transient state | `transientState.put("k",v)` | `nodeState.putTransient("k",v)` |
+| Prompt / send a callback | `action = Action.send(cb).build()` | `callbacksBuilder.nameCallback("prompt")` — see below |
+| Read a submitted callback | `callbacks.get(0).getName()` | `callbacks.getNameCallbacks().get(0)` — see below |
+
+Key 2.0 specifics:
+
+- **`nodeState.get("username")` returns a plain `String`** — do NOT call
+  `.asString()` on it (`TypeError: Cannot find function asString`). Wrap with
+  `String(...)` if you want a JS string. `nodeState.keys()` lists what's
+  present (after a plain username/password login: `realm, authLevel,
+  objectAttributes, username` — there is no `universalId`, and
+  `objectAttributes.get("mail")` is null).
+- **Sending callbacks**: `action` is an `ActionWrapper` that only exposes
+  `goTo` (+ session/error helpers) to scripts — it has **no `send` and no
+  `setCallbacks`** (both throw "Cannot find function"). Instead call the
+  `callbacksBuilder` binding, e.g. `callbacksBuilder.nameCallback("Hi, your
+  email?")`. These methods return **void** and *accumulate* callbacks; the
+  engine sends them automatically **only when the script ends without setting
+  an outcome** (don't call `action.goTo` on the prompt pass). Builder also has
+  `passwordCallback(prompt,echoOn)`, `choiceCallback`, `confirmationCallback`,
+  `textInputCallback`, `hiddenValueCallback`, `stringAttributeInputCallback`, …
+- **Reading callbacks**: `callbacks` is a `ScriptedCallbacksWrapper` with
+  `isEmpty()` and **typed getters** — there is **no `callbacks.get(i)`**. Use
+  `callbacks.getNameCallbacks()` → `List<String>` of entered values,
+  `getPasswordCallbacks()`, `getChoiceCallbacks()` → `List<int[]>`, etc.
+- **Reading a user profile attribute**: `var id =
+  idRepository.getIdentity(name); id.exists(); id.getAttributeValues("mail")` →
+  `List<String>`. ⚠ On this platform's store, AM identities are named by
+  **`fr-idm-uuid`**, so `getIdentity("<uid>")` (e.g. `"alice"`) returns a
+  not-found wrapper — `.exists()` is false and `getAttributeValues` then NPEs
+  on a null `amIdentity`. You must pass the user's **uuid**. There is no
+  uid→uuid search in the scripting API itself. (DataStoreDecision still
+  authenticates by uid fine — only the scripting `idRepository` lookup needs
+  the uuid.)
+  - **Get the uuid generically — don't hardcode it.** Put an
+    **`IdentifyExistingUserNode`** in the tree *before* the SDN, configured
+    `{identityAttribute:"userName", identifier:"userName"}`. It searches IDM
+    using `objectAttributes.userName` (DataStoreDecision already sets that),
+    and on its `true` outcome writes the resolved **uuid into `nodeState` as
+    `_id`**. The SDN then reads
+    `idRepository.getIdentity(String(nodeState.get("_id")))`. Works for any
+    user, no hardcoded uuid — live-verified in MfaLogin 2026-06-10. Wire
+    `Identify User` `true → <SDN>`, `false → FAILURE`. (The stock query nodes
+    `IdentifyExistingUserNode` / `QueryFilterDecisionNode` resolve users by
+    uid/userName against IDM, but they're *decision* nodes — they don't hand a
+    script arbitrary attributes, and `QueryFilterDecisionNode`'s filter is
+    static config, so it can't compare against live user input. Pairing
+    Identify-User with an SDN is the working combo.)
+- **Sandbox**: reflection is blocked (`obj.getClass()` → TypeError), and
+  `java.lang.System.currentTimeMillis()` is blocked — use `Date.now()`.
+- **⚠ Collection iteration is sandbox-blocked — index, don't iterate.** On a
+  `List` returned by a binding (e.g. `id.getAttributeValues("mail")`),
+  `.iterator()` / `.iterator().next()` throws `ScriptException: Access to Java
+  class "java.util.ArrayList$Itr" is prohibited` *at runtime* (saves and wires
+  fine; explain-tree can't catch it). Read by index instead: guard with
+  `.size() > 0` (or `!list.isEmpty()`) then take `list.get(0)`. Same applies to
+  any `for...of` / spread that would call `.iterator()` under the hood.
+  Live-burned 2026-06-10 building `TestMFA`'s Alice-email gate.
+- **Debugging**: `logger.error("MARKER " + value)` from a script **does reach
+  the AM pod stdout** (`kubectl logs -n identity <am-pod>` — grep your marker).
+  This is the fastest way to inspect bindings live. When a binding's real
+  method names are unknown, decompile from the AM jar:
+  `kubectl exec <am-pod> -c openam -- bash -lc 'cd /tmp; jar xf
+  /usr/local/tomcat/webapps/am/WEB-INF/lib/auth-nodes-8.1.0.jar <ClassPath>.class;
+  javap -public <ClassPath>.class'` — `ActionWrapper`,
+  `ScriptedCallbacksBuilder`, `ScriptedCallbacksWrapper` are in
+  `auth-nodes-8.1.0.jar`; `ScriptedIdentity*` in `openam-core-8.1.0.jar`.
+
+Minimal 2.0 prompt-and-verify skeleton (collect free text, compare to profile):
+
+```js
+// Prereq: an IdentifyExistingUserNode (identityAttribute:"userName") sits before
+// this SDN and has put the resolved uuid into nodeState as "_id".
+var username = String(nodeState.get("username"));
+if (username !== "alice") {
+  action.goTo("proceed");                 // no prompt for everyone else
+} else if (callbacks.isEmpty()) {
+  callbacksBuilder.nameCallback("Hi Alice, What is your email?");  // sends on script end
+} else {
+  var entered = String(callbacks.getNameCallbacks().get(0));
+  var id = idRepository.getIdentity(String(nodeState.get("_id")));  // uuid, NOT "alice"
+  var actual = (id && id.exists() && !id.getAttributeValues("mail").isEmpty())
+    ? String(id.getAttributeValues("mail").get(0)) : "";
+  action.goTo(actual !== "" && entered.trim().toLowerCase() === actual.trim().toLowerCase()
+    ? "proceed" : "incorrect");
+}
+```
+
+Re-stub of the Email/SMS-OTP dev idiom (the one in `am-node-outcomes.md`) for
+2.0 — the legacy `transientState.put` version silently breaks here:
+
+```js
+nodeState.putTransient("oneTimePassword", "000000");
+nodeState.putTransient("oneTimePasswordTimestamp", Date.now());
+action.goTo("set");
+```
 
 ### Variant: combining with a stock decision node
 

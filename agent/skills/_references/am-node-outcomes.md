@@ -164,14 +164,14 @@ Talk to IDM's managed-user (or other managed object) endpoint. Failure outcome i
 
 | Node type                         | Outcomes                                                          |
 |-----------------------------------|-------------------------------------------------------------------|
-| `OathRegistrationNode`            | `success`, `failure`                                              |
-| `OathTokenVerifierNode`           | `success`, `failure`, `not registered`, `recovery code`           |
+| `OathRegistrationNode`            | `successOutcome`, `failureOutcome` (displayNames "Success"/"Failure") |
+| `OathTokenVerifierNode`           | `successOutcome`, `failureOutcome`, `notRegisteredOutcome`, and `recoveryCodeOutcome` **only when `isRecoveryCodeAllowed: true`** (with it `false`, the node emits just the first 3 — wiring a `recoveryCodeOutcome` edge then is a harmless phantom AM ignores at runtime). displayNames "Success"/"Failure"/"Not registered"/"Recovery Code"; connections keys are the **ids**, not the displayNames. Live-verified on AM 8.1 root realm (TestMFA, 2026-06-17). |
 | `PushRegistrationNode`            | `success`, `failure`, `time out`                                  |
 | `PushAuthenticationSenderNode`    | `success`, `failure`, `not registered`                            |
 | `PushResultVerifierNode`          | `success`, `failure`, `expired`, `waiting`                        |
 | `PushWaitNode`                    | `done`                                                            |
 | `WebAuthnRegistrationNode`        | `unsupported`, `success`, `failure`, `error` (DOM/client error; displayName is "Client Error") |
-| `WebAuthnAuthenticationNode`      | `unsupported`, `success`, `failure`, `error` (DOM/client error; displayName is "Client Error"), `no device registered` |
+| `WebAuthnAuthenticationNode`      | `unsupported`, `noDevice` (displayName "No Device Registered"), `success`, `failure`, `error` (displayName "Client Error") |
 | `RecoveryCodeCollectorDecisionNode` | `success`, `failure`                                            |
 | `RecoveryCodeDisplayNode`         | `outcome`                                                         |
 | `OptOutMultiFactorAuthenticationNode` | `outcome`                                                     |
@@ -315,21 +315,26 @@ The three nodes communicate via **transient state**, not shared state:
 OTP (e.g. `000000` for local dev without SMTP), `SetStateNode` will NOT work —
 it writes shared state with **string-only values**, but the collector reads
 from **transient** state and expects a `Long` timestamp. The minimum-tools
-workaround is a `ScriptedDecisionNode` that does:
+workaround is a `ScriptedDecisionNode` (declaring `outcomes: ["set"]`) that
+seeds transient state. ⚠ On ForgeOps 2025.2 / AM 8.1, `upsert_script` creates
+scripts at the **next-gen evaluator (2.0)**, where `transientState` and
+`outcome` DON'T EXIST. Use the 2.0 bindings:
 
 ```js
-transientState.put("oneTimePassword", "000000");
-transientState.put("oneTimePasswordTimestamp", Date.now());
-outcome = "set";
+nodeState.putTransient("oneTimePassword", "000000");
+nodeState.putTransient("oneTimePasswordTimestamp", Date.now());
+action.goTo("set");
 ```
 
-> AM 8's script sandbox blocks `java.lang.System.currentTimeMillis()`
-> (TypeError: `JavaPackage` not callable). Use JS-native `Date.now()` — same
-> ms-since-epoch value, sandbox-safe. Live-burned during sanity-walk.
+> The legacy form (`transientState.put(...)` + `outcome = "set"`) saves and
+> wires fine but throws `ReferenceError: "transientState" is not defined` at
+> runtime — explain-tree can't catch it. See the full next-gen API table in
+> `am-tree-recipes.md` Recipe 7. (`Date.now()` is correct in both — AM's
+> sandbox blocks `java.lang.System.currentTimeMillis()`.) Live-burned 2026-06-10.
 
-…and declares `outcomes: ["set"]`. This single node replaces both generator
-and SMTP-sender for a dev tree. Document the stub clearly — anyone who can
-see the tree can sign in to any account whose password they know.
+This single node replaces both generator and SMTP-sender for a dev tree.
+Document the stub clearly — anyone who can see the tree can sign in to any
+account whose password they know.
 
 ### Update password with current-session check
 ```

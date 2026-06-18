@@ -1,0 +1,17 @@
+[
+  {
+    "name": "readonly-agent",
+    "token": "REPLACE_WITH_openssl_rand_base64_24",
+    "privileges": ["read"]
+  },
+  {
+    "name": "build-agent",
+    "token": "REPLACE_WITH_openssl_rand_base64_24",
+    "privileges": ["write"]
+  },
+  {
+    "name": "ci-deploy",
+    "token": "REPLACE_WITH_openssl_rand_base64_24",
+    "privileges": ["delete"]
+  }
+]
